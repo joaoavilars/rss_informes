@@ -1,6 +1,6 @@
-# RSS Reader
+# RSS Informes Sefaz
 
-Este é um aplicativo em Go (Golang) para extrair informações de um feed RSS de um site específico e gerar um arquivo XML contendo os itens do feed. Ele também inclui funcionalidades para comparar o XML gerado com um XML final e adicionar apenas os itens diferentes ao XML final.
+Este é um aplicativo em Go (Golang) para extrair informações  do site de informes do Sefaz e gerar um feed RSS. Ele também inclui funcionalidades para comparar o XML gerado com um XML final e adicionar apenas os itens diferentes ao XML final.
 
 ## Funcionalidades
 
