@@ -7,17 +7,17 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
-	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/html"
 )
 
 const (
-	tmpFile    = "rss.tmp"
 	updateLog  = "rss.upd"
 	compareLog = "rss.compare"
+	tempXML    = "temp.xml"
 )
 
 type Item struct {
@@ -43,120 +43,92 @@ type RSS struct {
 	Channel Channel  `xml:"channel"`
 }
 
-func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Uso: ./rss_informes <arquivo_de_saida.xml>")
-		return
-	}
-
-	xmlFile := os.Args[1]
-
-	if _, err := os.Stat(updateLog); os.IsNotExist(err) {
-		if _, err := os.Create(updateLog); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	if _, err := os.Stat(compareLog); os.IsNotExist(err) {
-		if _, err := os.Create(compareLog); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	if err := processRSS(xmlFile); err != nil {
-		log.Fatal(err)
-	}
-}
-
 func processRSS(xmlFile string) error {
-	url := "https://www.nfe.fazenda.gov.br/portal/informe.aspx?ehCTG=false"
+	url := "https://www.nfe.fazenda.gov.br/portal/informe.aspx?ehCTG=false&AspxAutoDetectCookieSupport=0"
 	fmt.Println("Obtendo conteúdo HTML da página:", url)
 
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	// Executar o comando wget para obter o código-fonte da página
+	cmd := exec.Command("wget", "-qO-", url)
+	output, err := cmd.Output()
 	if err != nil {
 		return err
 	}
 
-	// Baixar conteúdo do site para o arquivo temporário
-	tmpItems := make([]Item, 0)
-	doc.Find(".conteudo .container .divInforme").Each(func(i int, s *goquery.Selection) {
-		title := strings.TrimSpace(s.Find("p").Text())
-		link := url
-		desc := strings.TrimSpace(s.Text())
+	// Parsear o HTML da página
+	doc, err := html.Parse(strings.NewReader(string(output)))
+	if err != nil {
+		return err
+	}
 
-		if title != "" && desc != "" {
-			tmpItems = append(tmpItems, Item{
-				Title: title,
-				Link:  link,
-				Desc:  desc,
-			})
-		}
-	})
+	// Inicializar a estrutura RSS
+	rss := RSS{
+		Version: "2.0",
+		Channel: Channel{
+			Title: "Informes do Sefaz - NFe",
+			Link:  url,
+			Desc:  "Estatisticas da NF-e",
+		},
+	}
 
-	// Ler itens do arquivo final
+	// Extrair os itens do feed RSS
+	extractItems(doc, &rss)
+
+	// Converter a estrutura RSS em XML temporário
+	tempXMLBytes, err := xml.MarshalIndent(rss, "", "    ")
+	if err != nil {
+		return err
+	}
+
+	// Escrever o XML temporário no arquivo
+	if err := ioutil.WriteFile(tempXML, tempXMLBytes, 0644); err != nil {
+		return err
+	}
+
+	// Comparar o XML temporário com o XML final e adicionar itens diferentes ao XML final
+	if err := compareXML(xmlFile, tempXML); err != nil {
+		return err
+	}
+
+	fmt.Printf("Arquivo XML gerado com sucesso: %s\n", xmlFile)
+
+	return nil
+}
+
+func compareXML(xmlFile, tempXML string) error {
+	// Ler os itens do XML final
 	finalItems, err := readItemsFromXML(xmlFile)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil {
 		return err
 	}
 
-	// Criar ou carregar mapa de comparação de descrições
-	compareMap := make(map[string]string)
-	if len(finalItems) > 0 {
-		for _, item := range finalItems {
-			compareMap[item.Title] = item.Desc
-		}
-	} else {
-		// Se o arquivo final estiver vazio, criar GUIDs iniciais
-		for _, item := range tmpItems {
-			item.Guid = generateGUID()
+	// Ler os itens do XML temporário
+	tempItems, err := readItemsFromXML(tempXML)
+	if err != nil {
+		return err
+	}
+
+	// Adicionar itens diferentes ao XML final (no máximo 10 itens)
+	for _, item := range tempItems {
+		if !containsItem(finalItems, item) && len(finalItems) < 10 {
 			finalItems = append(finalItems, item)
-			compareMap[item.Title] = item.Desc
-		}
-		// Escrever itens iniciais no arquivo final
-		if err := writeItemsToXML(xmlFile, finalItems); err != nil {
-			return err
 		}
 	}
 
-	// Comparar descrições e atualizar GUIDs conforme necessário
-	updateMap := make(map[string]string)
-	for _, item := range tmpItems {
-		if prevDesc, ok := compareMap[item.Title]; ok {
-			if item.Desc != prevDesc {
-				item.Guid = generateGUID()
-				updateMap[item.Title] = item.Desc
-			}
-		} else {
-			item.Guid = generateGUID()
-			updateMap[item.Title] = item.Desc
-		}
-	}
-
-	// Atualizar itens no arquivo final com GUIDs atualizados
-	for i, item := range finalItems {
-		if desc, ok := updateMap[item.Title]; ok {
-			finalItems[i].Desc = desc
-			finalItems[i].Guid = generateGUID()
-		}
-	}
-
-	// Escrever itens atualizados no arquivo final
+	// Escrever os itens atualizados no XML final
 	if err := writeItemsToXML(xmlFile, finalItems); err != nil {
 		return err
 	}
 
-	// Salvar mapa de comparação atualizado
-	if err := saveUpdateLog(updateMap); err != nil {
-		return err
-	}
-
 	return nil
+}
+
+func containsItem(items []Item, newItem Item) bool {
+	for _, item := range items {
+		if item.Title == newItem.Title && item.Desc == newItem.Desc {
+			return true
+		}
+	}
+	return false
 }
 
 func readItemsFromXML(filePath string) ([]Item, error) {
@@ -179,18 +151,25 @@ func readItemsFromXML(filePath string) ([]Item, error) {
 	return rss.Channel.Items, nil
 }
 
-func saveUpdateLog(updateMap map[string]string) error {
-	file, err := os.Create(updateLog)
-	if err != nil {
-		return err
+func writeItemsToXML(filePath string, items []Item) error {
+	rss := &RSS{
+		Version: "2.0",
+		Channel: Channel{
+			Title: "Informes do Sefaz - NFe",
+			Link:  "https://www.nfe.fazenda.gov.br/portal/informe.aspx?ehCTG=false&AspxAutoDetectCookieSupport=0",
+			Desc:  "Estatísticas da NF-e",
+			Items: items,
+		},
 	}
-	defer file.Close()
 
-	for title, guid := range updateMap {
-		fmt.Fprintf(file, "%s %s\n", title, guid)
+	// Adicionar GUID aos novos itens
+	for i := range rss.Channel.Items {
+		if rss.Channel.Items[i].Guid == "" {
+			rss.Channel.Items[i].Guid = generateGUID()
+		}
 	}
 
-	return nil
+	return writeRSS(filePath, rss)
 }
 
 func writeRSS(filePath string, rss *RSS) error {
@@ -209,20 +188,6 @@ func writeRSS(filePath string, rss *RSS) error {
 	return nil
 }
 
-func writeItemsToXML(filePath string, items []Item) error {
-	rss := &RSS{
-		Version: "2.0",
-		Channel: Channel{
-			Title: "Informes do Sefaz - NFe",
-			Link:  "https://www.nfe.fazenda.gov.br/portal/informe.aspx?ehCTG=false",
-			Desc:  "Estatísticas da NF-e",
-			Items: items,
-		},
-	}
-
-	return writeRSS(filePath, rss)
-}
-
 func generateGUID() string {
 	uuid := make([]byte, 16)
 	if _, err := rand.Read(uuid); err != nil {
@@ -231,4 +196,85 @@ func generateGUID() string {
 	uuid[6] = (uuid[6] & 0x0f) | 0x40
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
 	return hex.EncodeToString(uuid)
+}
+
+func extractItems(n *html.Node, rss *RSS) {
+	if n.Type == html.ElementNode && n.Data == "div" && n.Attr != nil {
+		for _, attr := range n.Attr {
+			if attr.Key == "id" && attr.Val == "conteudoDinamico" {
+				extractItemDiv(n, rss)
+				return // Processa apenas esta div e retorna
+			}
+		}
+	}
+	// Percorre recursivamente os nós filhos
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		extractItems(c, rss)
+	}
+}
+
+func extractItemDiv(n *html.Node, rss *RSS) {
+	if n.Type == html.ElementNode && n.Data == "div" && n.Attr != nil {
+		for _, attr := range n.Attr {
+			if attr.Key == "class" && attr.Val == "divInforme" {
+				extractItemContent(n, rss)
+				return // Processa apenas esta div e retorna
+			}
+		}
+	}
+	// Percorre recursivamente os nós filhos
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		extractItemDiv(c, rss)
+	}
+}
+
+func extractItemContent(n *html.Node, rss *RSS) {
+	var title, desc string
+
+	// Extrair título
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && c.Data == "p" {
+			title = strings.TrimSpace(c.FirstChild.Data)
+			break
+		}
+	}
+
+	// Extrair descrição
+	var descBuilder strings.Builder
+	var foundTitle bool
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if foundTitle && c.Type == html.ElementNode && c.Data == "div" {
+			descBuilder.WriteString(strings.TrimSpace(c.FirstChild.Data))
+			descBuilder.WriteString("\n")
+		}
+		if !foundTitle && c.Type == html.ElementNode && c.Data == "p" && strings.TrimSpace(c.FirstChild.Data) == title {
+			foundTitle = true
+		}
+		if foundTitle && c.Type == html.TextNode {
+			descBuilder.WriteString(strings.TrimSpace(c.Data))
+			descBuilder.WriteString("\n")
+		}
+	}
+
+	desc = descBuilder.String()
+
+	// Adicionar o item ao RSS
+	if title != "" && desc != "" {
+		rss.Channel.Items = append(rss.Channel.Items, Item{
+			Title: title,
+			Desc:  desc,
+		})
+	}
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Println("Uso: ./nome_do_executável <arquivo_de_saida.xml>")
+		return
+	}
+
+	xmlFile := os.Args[1]
+	if err := processRSS(xmlFile); err != nil {
+		log.Fatal(err)
+	}
 }
